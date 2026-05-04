@@ -25,7 +25,7 @@ const DEFAULT_SETTINGS = {
     buyTransitionWaitMs: 8000,
     buyRecoveryMaxCount: 1,
     buyProcessingMaxWaitMs: 120000,
-    buyClickDelayMs: 500,
+    buyClickDelayMs: 150,
     minPageAgeBeforeBuyClickMs: 500,
     offerSignClickCooldownMs: 500,
     cryptoSignClickCooldownMs: 500,
@@ -46,7 +46,25 @@ const SIGN_LOCK_TTL_MS = 60000;
 const SIGN_QUEUE_COLLECT_MS = 150;
 const PRIORITY_MIN = 1;
 const PRIORITY_MAX = 5;
-const SETTINGS_MIGRATION_VERSION = 5200;
+const SETTINGS_MIGRATION_VERSION = 5710;
+
+// ============== COMBAT ALARM PLAN (v5.6) ==============
+// Защита от Chrome throttling скрытых вкладок:
+// background через chrome.alarms сам активирует вкладку и шлёт reload в T-0
+// и в страховочные точки T+0.8s / T+1.6s / T+2.4s, даже если content.js заморожен.
+const COMBAT_PLAN_KEY = "torgiBotCombatPlan";
+const COMBAT_ALARM_PREFIX = "torgiBotCombat:";
+// Смещения относительно startTimeMs:
+//   -3000  — активировать вкладку (снять throttling до старта)
+//       0  — T-0 reload
+//   +800/+1600/+2400 — страховочные reload, если кнопка не появилась
+const COMBAT_ALARM_STEPS = [
+    { id: "wake", offsetMs: -3000, kind: "activate" },
+    { id: "t0",   offsetMs: 0,     kind: "reload" },
+    { id: "s1",   offsetMs: 800,   kind: "reload_if_no_buy" },
+    { id: "s2",   offsetMs: 1600,  kind: "reload_if_no_buy" },
+    { id: "s3",   offsetMs: 2400,  kind: "reload_if_no_buy" }
+];
 
 function log(...args) {
     console.log("[TorgiBot BG]", ...args);
@@ -150,7 +168,10 @@ async function initializeStorageDefaults() {
         if (current.buyProcessingMaxWaitMs == null) {
             patch.buyProcessingMaxWaitMs = DEFAULT_SETTINGS.buyProcessingMaxWaitMs;
         }
-        if (current.buyClickDelayMs == null) {
+        // v5.7.1: миграция старых значений buyClickDelayMs (500/300) → 150 для ускорения клика «Купить».
+        if (current.buyClickDelayMs == null
+            || Number(current.buyClickDelayMs) === 500
+            || Number(current.buyClickDelayMs) === 300) {
             patch.buyClickDelayMs = DEFAULT_SETTINGS.buyClickDelayMs;
         }
         if (current.minPageAgeBeforeBuyClickMs == null) {
@@ -353,15 +374,233 @@ async function getTime100MoscowTime() {
 }
 
 
+// ===== Combat alarm plan helpers (v5.6) =====
+
+async function getCombatPlans() {
+    const data = await SESSION_STORAGE.get({ [COMBAT_PLAN_KEY]: {} });
+    return data[COMBAT_PLAN_KEY] || {};
+}
+
+async function setCombatPlans(plans) {
+    await SESSION_STORAGE.set({ [COMBAT_PLAN_KEY]: plans || {} });
+}
+
+function combatAlarmName(tabId, stepId) {
+    return `${COMBAT_ALARM_PREFIX}${tabId}:${stepId}`;
+}
+
+async function clearCombatAlarmsForTab(tabId) {
+    try {
+        const all = await chrome.alarms.getAll();
+        const prefix = `${COMBAT_ALARM_PREFIX}${tabId}:`;
+        await Promise.all(
+            all.filter(a => a.name.startsWith(prefix)).map(a => chrome.alarms.clear(a.name))
+        );
+    } catch (e) {
+        log("clearCombatAlarmsForTab error:", e);
+    }
+}
+
+async function clearAllCombatAlarms() {
+    try {
+        const all = await chrome.alarms.getAll();
+        await Promise.all(
+            all.filter(a => a.name.startsWith(COMBAT_ALARM_PREFIX)).map(a => chrome.alarms.clear(a.name))
+        );
+    } catch (e) {
+        log("clearAllCombatAlarms error:", e);
+    }
+}
+
+async function registerCombatPlan(message, sender) {
+    const tabId = sender?.tab?.id;
+    const startTimeMs = Number(message?.startTimeMs || 0);
+    if (!tabId || !startTimeMs) {
+        return { ok: false, error: "tabId/startTimeMs missing" };
+    }
+
+    const lotId = message?.lotId || null;
+    const url = sender?.tab?.url || null;
+    const now = Date.now();
+
+    // Снимаем старые alarm-ы для этой вкладки
+    await clearCombatAlarmsForTab(tabId);
+
+    const plans = await getCombatPlans();
+    plans[String(tabId)] = {
+        tabId,
+        startTimeMs,
+        lotId,
+        url,
+        registeredAt: now
+    };
+    await setCombatPlans(plans);
+
+    const scheduled = [];
+    for (const step of COMBAT_ALARM_STEPS) {
+        const whenMs = startTimeMs + step.offsetMs;
+        // Chrome alarms имеют минимальный delay ~0.5 мин по умолчанию,
+        // но при when в будущем они срабатывают почти точно (особенно когда SW проснётся).
+        // Если момент уже прошёл — пропускаем.
+        if (whenMs <= now + 50) continue;
+        try {
+            await chrome.alarms.create(combatAlarmName(tabId, step.id), { when: whenMs });
+            scheduled.push({ id: step.id, whenMs, offsetMs: step.offsetMs });
+        } catch (e) {
+            log("alarms.create error:", step.id, e);
+        }
+    }
+
+    log("Combat plan registered tab=", tabId, "start=", new Date(startTimeMs).toISOString(),
+        "scheduled=", scheduled.map(s => `${s.id}@${s.offsetMs}`).join(","));
+
+    return { ok: true, scheduled };
+}
+
+async function cancelCombatPlan(message, sender) {
+    const tabId = sender?.tab?.id ?? message?.tabId;
+    if (!tabId) return { ok: false, error: "tabId missing" };
+
+    await clearCombatAlarmsForTab(tabId);
+    const plans = await getCombatPlans();
+    delete plans[String(tabId)];
+    await setCombatPlans(plans);
+    log("Combat plan cancelled tab=", tabId, "reason=", message?.reason || "manual");
+    return { ok: true };
+}
+
+async function pingContent(tabId) {
+    try {
+        const resp = await chrome.tabs.sendMessage(tabId, { type: "PING" });
+        return !!resp?.ok;
+    } catch (e) {
+        return false;
+    }
+}
+
+async function hasBuyButtonInTab(tabId) {
+    try {
+        const resp = await chrome.tabs.sendMessage(tabId, { type: "QUERY_BUY_BUTTON" });
+        return !!resp?.present;
+    } catch (e) {
+        return null; // unknown
+    }
+}
+
+async function activateTab(tabId) {
+    try {
+        await chrome.tabs.update(tabId, { active: true });
+    } catch (e) {
+        log("tabs.update active error:", e);
+    }
+}
+
+async function reloadTab(tabId) {
+    try {
+        await chrome.tabs.reload(tabId);
+    } catch (e) {
+        log("tabs.reload error:", e);
+    }
+}
+
+chrome.alarms.onAlarm.addListener(async alarm => {
+    if (!alarm?.name?.startsWith(COMBAT_ALARM_PREFIX)) return;
+
+    const rest = alarm.name.slice(COMBAT_ALARM_PREFIX.length);
+    const [tabIdStr, stepId] = rest.split(":");
+    const tabId = Number(tabIdStr);
+    if (!tabId) return;
+
+    const plans = await getCombatPlans();
+    const plan = plans[String(tabId)];
+    if (!plan) {
+        log("Alarm fired but no plan for tab=", tabId, "step=", stepId);
+        return;
+    }
+
+    // Проверяем, что вкладка ещё существует и боевая
+    let tab;
+    try {
+        tab = await chrome.tabs.get(tabId);
+    } catch (e) {
+        await clearCombatAlarmsForTab(tabId);
+        delete plans[String(tabId)];
+        await setCombatPlans(plans);
+        return;
+    }
+
+    if (!tab?.url || !tab.url.includes("torgi.gov.ru")) {
+        log("Alarm: tab no longer on torgi, dropping plan tab=", tabId);
+        await clearCombatAlarmsForTab(tabId);
+        delete plans[String(tabId)];
+        await setCombatPlans(plans);
+        return;
+    }
+
+    const settings = await getSettings(tabId);
+    if (settings.botEnabled !== true) {
+        log("Alarm: bot disabled for tab=", tabId, "— cancelling plan");
+        await clearCombatAlarmsForTab(tabId);
+        delete plans[String(tabId)];
+        await setCombatPlans(plans);
+        return;
+    }
+
+    const step = COMBAT_ALARM_STEPS.find(s => s.id === stepId);
+    if (!step) return;
+
+    log("Alarm fired tab=", tabId, "step=", stepId, "kind=", step.kind, "lateMs=", Date.now() - (plan.startTimeMs + step.offsetMs));
+
+    if (step.kind === "activate") {
+        // Снимаем throttling: делаем вкладку активной
+        if (!tab.active) {
+            await activateTab(tabId);
+        }
+        // ping контента — если жив, он сам подхватит
+        await pingContent(tabId);
+        return;
+    }
+
+    if (step.kind === "reload") {
+        // T-0: безусловный reload через background, чтобы обойти заморозку
+        // Сначала делаем активной (на случай если она ещё не активна)
+        if (!tab.active) await activateTab(tabId);
+        await reloadTab(tabId);
+        return;
+    }
+
+    if (step.kind === "reload_if_no_buy") {
+        // Страховка: если кнопки всё ещё нет — ещё один reload
+        if (!tab.active) await activateTab(tabId);
+        const present = await hasBuyButtonInTab(tabId);
+        // present === true → не трогаем; false или null (контент не отвечает) → reload
+        if (present === true) {
+            log("Alarm safety step", stepId, ": buy button present, skipping reload");
+            // План больше не нужен — кнопка есть
+            await clearCombatAlarmsForTab(tabId);
+            delete plans[String(tabId)];
+            await setCombatPlans(plans);
+            return;
+        }
+        log("Alarm safety step", stepId, ": no buy button (present=", present, ") → reload");
+        await reloadTab(tabId);
+        return;
+    }
+});
+
 chrome.runtime.onInstalled.addListener(async () => {
     await initializeStorageDefaults();
     await setExtensionIcon(false);
+    await clearAllCombatAlarms();
+    await setCombatPlans({});
 });
 
 chrome.runtime.onStartup.addListener(async () => {
     await initializeStorageDefaults();
     const settings = await getSettings();
     await setExtensionIcon(settings.botEnabled === true);
+    await clearAllCombatAlarms();
+    await setCombatPlans({});
 });
 
 chrome.action.onClicked.addListener(async () => {
@@ -384,6 +623,14 @@ chrome.tabs.onRemoved.addListener(async tabId => {
     const waiters = await getSignWaiters();
     delete waiters[String(tabId)];
     await setSignWaiters(waiters);
+
+    // v5.6: убираем combat-план для закрытой вкладки
+    await clearCombatAlarmsForTab(tabId);
+    const plans = await getCombatPlans();
+    if (plans[String(tabId)]) {
+        delete plans[String(tabId)];
+        await setCombatPlans(plans);
+    }
 });
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
@@ -463,6 +710,55 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         if (message?.type === "GET_TIME100_MOSCOW_TIME") {
             const result = await getTime100MoscowTime();
             sendResponse(result);
+            return;
+        }
+
+        if (message?.type === "REGISTER_COMBAT_PLAN") {
+            sendResponse(await registerCombatPlan(message, sender));
+            return;
+        }
+
+        if (message?.type === "CANCEL_COMBAT_PLAN") {
+            sendResponse(await cancelCombatPlan(message, sender));
+            return;
+        }
+
+        if (message?.type === "GET_TORGI_TABS_COUNT") {
+            try {
+                const tabs = await chrome.tabs.query({ url: "*://*.torgi.gov.ru/*" });
+                sendResponse({ ok: true, count: tabs.length, tabIds: tabs.map(t => t.id) });
+            } catch (e) {
+                sendResponse({ ok: false, error: String(e) });
+            }
+            return;
+        }
+
+        if (message?.type === "START_ALL_TABS" || message?.type === "STOP_ALL_TABS") {
+            const enable = message.type === "START_ALL_TABS";
+            try {
+                const tabs = await chrome.tabs.query({ url: "*://*.torgi.gov.ru/*" });
+                let applied = 0;
+                for (const tab of tabs) {
+                    if (tab.id == null) continue;
+                    try {
+                        await setTabSettings(tab.id, { botEnabled: enable });
+                        const settings = await getSettings(tab.id);
+                        try {
+                            await chrome.tabs.sendMessage(tab.id, {
+                                type: "TAB_SETTINGS_CHANGED",
+                                settings,
+                                broadcast: true
+                            });
+                        } catch (_) { /* вкладка может не иметь content script */ }
+                        applied++;
+                    } catch (e) {
+                        log("START/STOP_ALL: ошибка для вкладки", tab.id, e);
+                    }
+                }
+                sendResponse({ ok: true, applied, total: tabs.length, enabled: enable });
+            } catch (e) {
+                sendResponse({ ok: false, error: String(e) });
+            }
             return;
         }
 

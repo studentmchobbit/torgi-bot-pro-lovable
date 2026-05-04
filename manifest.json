@@ -1,11 +1,13 @@
 {
   "manifest_version": 3,
-  "name": "Torgi Bot Pro",
-  "version": "5.2",
+  "name": "Torgi Bot Pro v5.7.1",
+  "version": "5.7.1",
   "description": "Автоматизация покупки лотов на torgi.gov.ru",
   "permissions": [
     "storage",
-    "tabs"
+    "downloads",
+    "tabs",
+    "alarms"
   ],
   "host_permissions": [
     "*://*.torgi.gov.ru/*",

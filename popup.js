@@ -128,7 +128,7 @@ async function render() {
 
     document.getElementById("val-pre").textContent = settings.preStartSeconds ?? "—";
     document.getElementById("val-reload").textContent = settings.reloadInterval ?? "—";
-    document.getElementById("val-buy-delay").textContent = `${settings.buyClickDelayMs ?? 500} мс`;
+    document.getElementById("val-buy-delay").textContent = `${settings.buyClickDelayMs ?? 150} мс`;
     document.getElementById("val-page-age").textContent = `${settings.minPageAgeBeforeBuyClickMs ?? 500} мс`;
     document.getElementById("val-session-refresh").textContent =
         settings.preStartSessionRefreshEnabled
@@ -137,7 +137,7 @@ async function render() {
     document.getElementById("val-test").textContent =
         settings.stopBeforeFinalSelect ? "Вкл (не жмёт «Выбрать»)" : "Выкл";
 
-    if (buyDelaySelect) buyDelaySelect.value = String(settings.buyClickDelayMs ?? 500);
+    if (buyDelaySelect) buyDelaySelect.value = String(settings.buyClickDelayMs ?? 150);
     if (pageAgeSelect) pageAgeSelect.value = String(settings.minPageAgeBeforeBuyClickMs ?? 500);
 }
 
@@ -260,3 +260,82 @@ document.getElementById("diag-clear-btn").addEventListener("click", async () => 
 });
 
 render();
+
+async function refreshTabsCount() {
+    return new Promise(resolve => {
+        chrome.runtime.sendMessage({ type: "GET_TORGI_TABS_COUNT" }, res => {
+            const el = document.getElementById("tabs-count");
+            if (chrome.runtime.lastError || !res?.ok) {
+                if (el) el.textContent = "(—)";
+                resolve(0);
+                return;
+            }
+            if (el) el.textContent = `(${res.count})`;
+            resolve(res.count || 0);
+        });
+    });
+}
+
+document.getElementById("start-all-btn").addEventListener("click", () => {
+    const btn = document.getElementById("start-all-btn");
+    btn.disabled = true;
+    chrome.runtime.sendMessage({ type: "START_ALL_TABS" }, async (res) => {
+        btn.disabled = false;
+        if (chrome.runtime.lastError || !res?.ok) {
+            showMessage("Ошибка: " + (res?.error || chrome.runtime.lastError?.message || "—"), "error");
+            return;
+        }
+        if (res.total === 0) {
+            showMessage("Нет открытых вкладок torgi.gov.ru", "error");
+            return;
+        }
+        showMessage(`Бот включён в ${res.applied} из ${res.total} вкладок`, "ok");
+        await render();
+    });
+});
+
+document.getElementById("stop-all-btn").addEventListener("click", () => {
+    const btn = document.getElementById("stop-all-btn");
+    btn.disabled = true;
+    chrome.runtime.sendMessage({ type: "STOP_ALL_TABS" }, async (res) => {
+        btn.disabled = false;
+        if (chrome.runtime.lastError || !res?.ok) {
+            showMessage("Ошибка: " + (res?.error || chrome.runtime.lastError?.message || "—"), "error");
+            return;
+        }
+        if (res.total === 0) {
+            showMessage("Нет открытых вкладок torgi.gov.ru", "error");
+            return;
+        }
+        showMessage(`Бот выключен в ${res.applied} из ${res.total} вкладок`, "ok");
+        await render();
+    });
+});
+
+refreshTabsCount();
+setInterval(refreshTabsCount, 2000);
+
+document.getElementById("diag-download-btn").addEventListener("click", async () => {
+    const res = await sendActiveTabMessage({ type: "DIAGNOSTIC_GET_REPORT" });
+    if (!res?.ok || !res.report) {
+        showMessage("Откройте страницу лота torgi.gov.ru", "error");
+        return;
+    }
+    try {
+        const dataUrl = "data:application/json;charset=utf-8," + encodeURIComponent(res.report);
+        const ts = new Date().toISOString().replace(/[:.]/g, "-");
+        chrome.downloads.download({
+            url: dataUrl,
+            filename: `torgi-diag-${ts}.json`,
+            saveAs: true
+        }, (id) => {
+            if (chrome.runtime.lastError || !id) {
+                showMessage("Ошибка загрузки: " + (chrome.runtime.lastError?.message || ""), "error");
+            } else {
+                showMessage("Файл сохраняется…", "ok");
+            }
+        });
+    } catch (e) {
+        showMessage("Ошибка: " + e.message, "error");
+    }
+});

@@ -7,7 +7,8 @@
     let started = false;
     const _savedState = sessionStorage.getItem("torgiBotState") || "WAIT_BUY";
     const _nonResumable = ["AUTH_REQUIRED", "AUTH_OR_BACKEND_GATE", "WIN", "LOSS"];
-    let state = _nonResumable.includes(_savedState) ? "WAIT_BUY" : _savedState;
+    const _savedStateWasNonResumable = _nonResumable.includes(_savedState);
+    let state = _savedStateWasNonResumable ? "WAIT_BUY" : _savedState;
 
     let settings = null;
     let widgetEl = null;
@@ -58,6 +59,7 @@
     let lastAuthDiagnostics = null;
     let diagnosticLog = [];
     let lastReportCopyStatus = "";
+    let authStateMeta = null;
     const DIAGNOSTIC_LOG_LIMIT = 3000;
     const SOFT_AUTH_DIALOG_RETRY_MAX = 3;
     const SOFT_AUTH_DIALOG_RETRY_DELAY_MS = 600;
@@ -65,7 +67,7 @@
     const SOFT_AUTH_CANCEL_WAIT_MS = 250;
     const SOFT_AUTH_CANCEL_WAIT_MAX = 4;
     const BUY_ACTIONABILITY_STABLE_MS = 100;
-    const DEFAULT_BUY_CLICK_DELAY_MS = 500;
+    const DEFAULT_BUY_CLICK_DELAY_MS = 150;
     const DEFAULT_MIN_PAGE_AGE_BEFORE_BUY_CLICK_MS = 500;
 
     try {
@@ -75,7 +77,186 @@
         diagnosticLog = [];
     }
 
+    try {
+        authStateMeta = JSON.parse(sessionStorage.getItem("torgiBotAuthStateMeta") || "null");
+    } catch (_) {
+        authStateMeta = null;
+    }
+    if (_savedStateWasNonResumable) {
+        authStateMeta = null;
+        sessionStorage.removeItem("torgiBotAuthStateMeta");
+    }
+
     sessionStorage.removeItem("torgiBotDiagnosticReloadStress");
+
+    // ================= v5.5 DIAGNOSTIC EXTENSIONS (passive only) =================
+    // Все ниже — только сбор данных. Не влияет на FSM, reload, клики.
+    const DIAG_SESSION_ID = (() => {
+        let id = sessionStorage.getItem("torgiBotDiagSessionId");
+        if (!id) {
+            id = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+            sessionStorage.setItem("torgiBotDiagSessionId", id);
+        }
+        return id;
+    })();
+
+    let diagDomMutationCount = 0;
+    let diagDomMutationsSinceLastTick = 0;
+    let diagWasHiddenSinceLastTick = (document.visibilityState === "hidden");
+    let diagLastTickAt = 0;
+    let diagLastResourceCount = 0;
+    let diagBuyAppearLogged = false;
+    let diagBuyClickableAppearLogged = false;
+    let diagBuyDomFirstSeenAt = 0;
+    let diagBuyClickableFirstSeenAt = 0;
+
+    try {
+        const diagMo = new MutationObserver((mutations) => {
+            diagDomMutationCount += mutations.length;
+            diagDomMutationsSinceLastTick += mutations.length;
+        });
+        diagMo.observe(document.documentElement || document, {
+            childList: true, subtree: true, attributes: true, characterData: false
+        });
+    } catch (_) {}
+
+    try {
+        document.addEventListener("visibilitychange", () => {
+            if (document.visibilityState === "hidden") diagWasHiddenSinceLastTick = true;
+        }, true);
+    } catch (_) {}
+
+    function diagGetPageLoadDurationMs() {
+        try {
+            const nav = performance.getEntriesByType?.("navigation")?.[0];
+            if (nav && nav.loadEventEnd > 0) {
+                return Math.round(nav.loadEventEnd - nav.startTime);
+            }
+            const t = performance.timing;
+            if (t && t.loadEventEnd > 0 && t.navigationStart > 0) {
+                return t.loadEventEnd - t.navigationStart;
+            }
+        } catch (_) {}
+        return null;
+    }
+
+    function diagGetNavigationType() {
+        try {
+            const nav = performance.getEntriesByType?.("navigation")?.[0];
+            if (nav) return nav.type || null;
+        } catch (_) {}
+        return null;
+    }
+
+    function diagGetTMinusMs() {
+        try {
+            const startMs = lastTimingInfo?.start ? new Date(lastTimingInfo.start).getTime() : 0;
+            if (!startMs) return null;
+            const now = (typeof getSyncedNowDate === "function") ? getSyncedNowDate().getTime() : Date.now();
+            return startMs - now;
+        } catch (_) { return null; }
+    }
+
+    function diagCollectNewResources() {
+        try {
+            const all = performance.getEntriesByType?.("resource") || [];
+            const fresh = all.slice(diagLastResourceCount);
+            diagLastResourceCount = all.length;
+            const filtered = fresh
+                .filter(r => r.initiatorType === "xmlhttprequest" || r.initiatorType === "fetch")
+                .slice(-40)
+                .map(r => {
+                    let path = r.name;
+                    try {
+                        const u = new URL(r.name);
+                        path = u.pathname + (u.search ? "?" + u.search.slice(0, 60) : "");
+                    } catch (_) {}
+                    return {
+                        url: path.slice(0, 220),
+                        type: r.initiatorType,
+                        startMs: Math.round(r.startTime),
+                        durMs: Math.round(r.duration),
+                        size: r.transferSize || 0,
+                        status: r.responseStatus || null
+                    };
+                });
+            return { newCount: fresh.length, totalCount: all.length, items: filtered };
+        } catch (e) {
+            return { newCount: 0, totalCount: 0, items: [], error: String(e) };
+        }
+    }
+
+    function diagBuildExtras() {
+        const tMinus = diagGetTMinusMs();
+        const extras = {
+            sid: DIAG_SESSION_ID,
+            tMinus,
+            visibilityState: document.visibilityState,
+            wasHiddenSinceLastTick: diagWasHiddenSinceLastTick,
+            documentReadyState: document.readyState,
+            domMutationsSinceLastTick: diagDomMutationsSinceLastTick,
+            domMutationsTotal: diagDomMutationCount,
+            pageLoadDurationMs: diagGetPageLoadDurationMs(),
+            navigationType: diagGetNavigationType(),
+            pageAgeMs: Date.now() - pageReadyAt,
+            network: diagCollectNewResources()
+        };
+        diagDomMutationsSinceLastTick = 0;
+        diagWasHiddenSinceLastTick = (document.visibilityState === "hidden");
+        diagLastTickAt = Date.now();
+        return extras;
+    }
+
+    // Снимаем "первое появление" кнопки Купить и первой кликабельности с tMinus
+    function diagMaybeRecordBuyAppear(snapshot) {
+        try {
+            if (snapshot.buyButtonPresentDom && !diagBuyAppearLogged) {
+                diagBuyAppearLogged = true;
+                diagBuyDomFirstSeenAt = Date.now();
+                diagnosticRecord("v55_buy_appear_dom", {
+                    tMinus: diagGetTMinusMs(),
+                    visibilityState: document.visibilityState,
+                    documentReadyState: document.readyState,
+                    pageAgeMs: Date.now() - pageReadyAt,
+                    pageLoadDurationMs: diagGetPageLoadDurationMs(),
+                    lotId: snapshot.lotId,
+                    visible: snapshot.buyButtonVisible,
+                    clickable: snapshot.buyButtonClickable
+                });
+            }
+            if (snapshot.buyButtonClickable && !diagBuyClickableAppearLogged) {
+                diagBuyClickableAppearLogged = true;
+                diagBuyClickableFirstSeenAt = Date.now();
+                diagnosticRecord("v55_buy_appear_clickable", {
+                    tMinus: diagGetTMinusMs(),
+                    visibilityState: document.visibilityState,
+                    pageAgeMs: Date.now() - pageReadyAt,
+                    clickableDelayFromDomMs: diagBuyDomFirstSeenAt
+                        ? (diagBuyClickableFirstSeenAt - diagBuyDomFirstSeenAt) : null,
+                    lotId: snapshot.lotId
+                });
+            }
+        } catch (_) {}
+    }
+
+    // Терминальные/особые состояния — снимаем "прощальный" снапшот (последние ~20 тиков уже в логе)
+    function diagRecordFarewell(reason) {
+        try {
+            diagnosticRecord("v55_farewell", {
+                reason,
+                tMinus: diagGetTMinusMs(),
+                state,
+                url: location.href,
+                visibilityState: document.visibilityState,
+                documentReadyState: document.readyState,
+                pageAgeMs: Date.now() - pageReadyAt,
+                botEnabled: !!settings?.botEnabled,
+                authRequired: (typeof isAuthRequired === "function") ? isAuthRequired() : null,
+                lastApiStatus: diagnosticLastApiStatus
+            });
+        } catch (_) {}
+    }
+    // ================= /v5.5 =================
 
     function playDoneSound() {
         try {
@@ -177,6 +358,66 @@
         return entry;
     }
 
+    // === v5.7-debug: микро-таймстемпы фаз для анализа реальной параллельности ===
+    function dbg(stage, extra = {}) {
+        try {
+            diagnosticRecord("dbg_" + stage, {
+                tMs: Date.now(),
+                lotId: (typeof getLotIdFromUrl === "function") ? getLotIdFromUrl() : null,
+                priority: settings?.lotPriority ?? null,
+                signLockHeld,
+                ...extra
+            });
+        } catch (e) {
+            try { console.warn("[TorgiBot dbg]", stage, e); } catch (_) {}
+        }
+    }
+
+    function collectAuthDialogSnapshot() {
+        const authDialog = findAuthDialog();
+        const text = normalizeText(authDialog?.innerText || authDialog?.textContent);
+        return {
+            at: new Date().toISOString(),
+            present: !!authDialog,
+            text: text.slice(0, 1200),
+            html: authDialog?.outerHTML ? authDialog.outerHTML.slice(0, 2000) : ""
+        };
+    }
+
+    function recordAuthTerminalState(nextState, reason, details = {}) {
+        if (authStateMeta?.authStateReason) return authStateMeta;
+
+        const realAuthReason = details.realAuthReason ?? getRealAuthUrlReason() ?? null;
+        const authDialogSnapshotAt = details.authDialogSnapshotAt || collectAuthDialogSnapshot();
+        authStateMeta = {
+            authStateReason: reason,
+            authStateAt: new Date().toISOString(),
+            authStateUrlAt: location.href,
+            authDialogSnapshotAt,
+            softDialogAttempts: {
+                afterBuy: softAuthDialogRetryCount,
+                afterReload: postReloadSoftAuthRetryCount
+            },
+            realAuthReason,
+            terminalState: nextState,
+            source: details.source || null,
+            context: details.context || null
+        };
+
+        try {
+            sessionStorage.setItem("torgiBotAuthStateMeta", JSON.stringify(authStateMeta));
+        } catch (_) {}
+
+        diagnosticRecord("fsm_terminal_state", authStateMeta);
+        diagRecordFarewell("fsm_terminal_state");
+        return authStateMeta;
+    }
+
+    function clearAuthStateMeta() {
+        authStateMeta = null;
+        sessionStorage.removeItem("torgiBotAuthStateMeta");
+    }
+
     function shouldTraceTestFlow() {
         return diagnosticActive || settings?.stopBeforeFinalSelect !== false;
     }
@@ -233,7 +474,8 @@
             sessionStorage.setItem("torgiBotLastTrackedReload", JSON.stringify(info));
         } catch (_) {}
 
-        diagnosticRecord("reload_before", info);
+        diagnosticRecord("reload_before", { ...info, v55: (typeof diagBuildExtras === "function") ? diagBuildExtras() : null });
+        try { diagRecordFarewell("reload:" + reason); } catch (_) {}
         location.reload();
     }
 
@@ -587,7 +829,54 @@
         }
 
         releaseSignLock("stop_all_timers");
+        cancelCombatPlan("stop_all_timers");
     }
+
+    // ===== Combat plan via chrome.alarms in background (v5.6) =====
+    let lastRegisteredCombatPlanKey = null;
+
+    function registerCombatPlan(startTimeMs, lotId, reason) {
+        if (!startTimeMs) return;
+        const key = `${startTimeMs}|${lotId || ""}`;
+        if (key === lastRegisteredCombatPlanKey) return;
+        lastRegisteredCombatPlanKey = key;
+        try {
+            chrome.runtime.sendMessage({
+                type: "REGISTER_COMBAT_PLAN",
+                startTimeMs,
+                lotId: lotId || null,
+                reason: reason || null
+            }, resp => {
+                if (chrome.runtime.lastError) {
+                    log("registerCombatPlan error:", chrome.runtime.lastError.message);
+                    return;
+                }
+                if (resp?.ok) {
+                    try {
+                        diagnosticRecord("combat_plan_registered_bg", {
+                            startTimeMs,
+                            lotId,
+                            reason: reason || null,
+                            scheduled: resp.scheduled || []
+                        });
+                    } catch (_) {}
+                }
+            });
+        } catch (e) {
+            log("registerCombatPlan exception:", e);
+        }
+    }
+
+    function cancelCombatPlan(reason) {
+        lastRegisteredCombatPlanKey = null;
+        try {
+            chrome.runtime.sendMessage({
+                type: "CANCEL_COMBAT_PLAN",
+                reason: reason || null
+            }, () => { void chrome.runtime.lastError; });
+        } catch (_) {}
+    }
+
 
     function stopAutomationTimersKeepJournal(reason = "stop_automation_keep_journal") {
         if (logicTimer) clearInterval(logicTimer);
@@ -610,6 +899,7 @@
         }
 
         releaseSignLock(reason);
+        cancelCombatPlan(reason || "stopAutomationTimersKeepJournal");
     }
 
     function scheduleReload(ms) {
@@ -767,6 +1057,12 @@
             pageReadyAgeMs: Date.now() - pageReadyAt
         }));
 
+        // v5.6: регистрируем план в background через chrome.alarms,
+        // чтобы T-0 reload и страховочные сработали даже при заморозке вкладки.
+        if (targetStartMs) {
+            registerCombatPlan(targetStartMs, lotId, "startCombatPoll");
+        }
+
         combatPollTimer = setInterval(() => {
             if (state !== "WAIT_BUY" || !settings?.botEnabled) {
                 clearInterval(combatPollTimer);
@@ -805,6 +1101,7 @@
                 clearInterval(combatPollTimer);
                 combatPollTimer = null;
                 log("Боевой режим: кнопка «Купить» обнаружена");
+                cancelCombatPlan("buy_button_found");
                 runLogic();
                 startObserverLoop(true);
                 return;
@@ -942,6 +1239,7 @@
             sessionStorage.setItem("torgiBotState", "WAIT_BUY");
             sessionStorage.removeItem("torgiBotSoftAuthDialogRetryCount");
             sessionStorage.removeItem("torgiBotPostReloadSoftAuthRetryCount");
+            clearAuthStateMeta();
             state = "WAIT_BUY";
             softAuthDialogRetryCount = 0;
             postReloadSoftAuthRetryCount = 0;
@@ -1380,6 +1678,16 @@
             buyButtonDiagnostics,
             authRequired: isAuthRequired(),
             authDiagnostics: lastAuthDiagnostics,
+            authStateMeta,
+            authStateReason: authStateMeta?.authStateReason || null,
+            authStateAt: authStateMeta?.authStateAt || null,
+            authStateUrlAt: authStateMeta?.authStateUrlAt || null,
+            authDialogSnapshotAt: authStateMeta?.authDialogSnapshotAt || null,
+            softDialogAttempts: authStateMeta?.softDialogAttempts || {
+                afterBuy: softAuthDialogRetryCount,
+                afterReload: postReloadSoftAuthRetryCount
+            },
+            realAuthReason: authStateMeta?.realAuthReason ?? getRealAuthUrlReason() ?? null,
             visibleLotStatus: getLotStatusText(),
             lastApiStatus: diagnosticLastApiStatus,
             timeSource: timeSync.ok ? timeSync.source : "local",
@@ -1463,8 +1771,11 @@
             authRequired: snapshot.authRequired,
             authReason: authDetails?.reason || null,
             authDetails,
-            visibleLotStatus: snapshot.visibleLotStatus
+            visibleLotStatus: snapshot.visibleLotStatus,
+            v55: diagBuildExtras()
         });
+
+        diagMaybeRecordBuyAppear(snapshot);
 
         if (snapshot.buyButtonPresentDom) {
             const buySeenKey = `${snapshot.lotId || "no-lot"}:${location.href}`;
@@ -2369,7 +2680,13 @@
             buyButtonVisible: buyButtonDiagnostics.visible,
             buyButtonClickable: buyButtonDiagnostics.clickable,
             buyButtonDiagnostics,
-            html: buyBtn?.outerHTML ? buyBtn.outerHTML.slice(0, 1500) : ""
+            html: buyBtn?.outerHTML ? buyBtn.outerHTML.slice(0, 1500) : "",
+            v55: {
+                ...(typeof diagBuildExtras === "function" ? diagBuildExtras() : {}),
+                tMinusAtClick: (typeof diagGetTMinusMs === "function") ? diagGetTMinusMs() : null,
+                msFromBuyDomAppear: diagBuyDomFirstSeenAt ? Date.now() - diagBuyDomFirstSeenAt : null,
+                msFromBuyClickableAppear: diagBuyClickableFirstSeenAt ? Date.now() - diagBuyClickableFirstSeenAt : null
+            }
         }));
         diagnosticRecord("buy_click_timing", getCombatTimingPayload({
             fromUrl: buyClickedUrl,
@@ -2905,6 +3222,11 @@
                 authDetails,
                 lastReload
             });
+            recordAuthTerminalState("AUTH_REQUIRED", "real_auth_url", {
+                source: "after_combat_reload_real_auth_url",
+                realAuthReason,
+                context: { lastReload, authDetails }
+            });
             setState("AUTH_REQUIRED");
             stopAllTimers();
             updateWidget();
@@ -2924,6 +3246,19 @@
                 },
                 authDetails,
                 lastReload
+            });
+            recordAuthTerminalState("AUTH_REQUIRED", "auth_dialog_after_reload", {
+                source: "after_combat_reload",
+                realAuthReason: softInfo.realAuthReason || null,
+                context: {
+                    lastReload,
+                    authDetails,
+                    softInfo: {
+                        publicLotUrl: softInfo.publicLotUrl,
+                        hasCancelButton: !!softInfo.cancelButton,
+                        dialogText: softInfo.dialogText
+                    }
+                }
             });
             setState("AUTH_REQUIRED");
             stopAllTimers();
@@ -2950,6 +3285,11 @@
                 onFound: () => handlePostReloadAuthDialog(lastReload),
                 onLimit: () => {
                     if (state !== "WAIT_BUY") return;
+                    recordAuthTerminalState("AUTH_OR_BACKEND_GATE", "post_reload_cancel_button_not_found", {
+                        source: "post_reload_soft_auth_cancel_not_found",
+                        realAuthReason: null,
+                        context: { lastReload, softInfo }
+                    });
                     setState("AUTH_OR_BACKEND_GATE");
                     stopAutomationTimersKeepJournal("post_reload_soft_auth_cancel_not_found");
                     updateWidget();
@@ -2967,6 +3307,16 @@
                 lastReload,
                 ...getBuyButtonDiagnosticFields()
             }));
+            recordAuthTerminalState("AUTH_OR_BACKEND_GATE", "post_reload_soft_dialog_retry_exhausted", {
+                source: "post_reload_soft_auth_retry_limit_reached",
+                realAuthReason: null,
+                context: {
+                    lastReload,
+                    retryCount: postReloadSoftAuthRetryCount,
+                    retryMax: SOFT_AUTH_DIALOG_RETRY_MAX,
+                    dialogText: softInfo.dialogText
+                }
+            });
             setState("AUTH_OR_BACKEND_GATE");
             stopAutomationTimersKeepJournal("post_reload_soft_auth_retry_limit_reached");
             updateWidget();
@@ -3117,15 +3467,21 @@
             }
 
             if (getRealAuthUrlReason()) {
+                const realAuthReason = getRealAuthUrlReason();
                 log("Обнаружен реальный переход на авторизацию — автоматическое участие остановлено.");
                 markAuthRequired("run_logic_auth_url");
                 diagnosticRecord("real_auth_required", {
                     source: "run_logic_auth_url",
-                    reason: getRealAuthUrlReason(),
+                    reason: realAuthReason,
                     url: location.href,
                     state
                 });
                 traceTestFlow("auth_required", collectDiagnosticPageSnapshot());
+                recordAuthTerminalState("AUTH_REQUIRED", "real_auth_url", {
+                    source: "run_logic_auth_url",
+                    realAuthReason,
+                    context: { url: location.href }
+                });
                 setState("AUTH_REQUIRED");
                 stopAllTimers();
                 return;
@@ -3133,8 +3489,13 @@
 
             if (state !== "WAIT_CHECKBOX" && isAuthRequired()) {
                 log("Обнаружен экран авторизации — сессия не активна. Автоматическое участие остановлено.");
-                markAuthRequired("run_logic_start");
+                const authDetails = markAuthRequired("run_logic_start");
                 traceTestFlow("auth_required", collectDiagnosticPageSnapshot());
+                recordAuthTerminalState("AUTH_REQUIRED", "auth_dialog_outside_buy", {
+                    source: "run_logic_start",
+                    realAuthReason: authDetails?.urlReason || null,
+                    context: { authDetails }
+                });
                 setState("AUTH_REQUIRED");
                 stopAllTimers();
                 return;
@@ -3250,6 +3611,35 @@
 
                     log("WAIT_BUY: задержка перед 'Купить' завершена, нажимаю");
                     if (aggressiveClick(finalCheck.button, "Купить")) {
+                        const buyClickAtMs = Date.now();
+                        const buyClickUrl = location.href;
+                        dbg("buy_click", { ok: true, delayUsedMs: timingGuard.waitMs });
+                        // v5.7.1: верификатор клика — через 1500 мс проверим, что URL сменился (или статус стал SUSPENDED).
+                        setTimeout(() => {
+                            try {
+                                const urlChanged = location.href !== buyClickUrl
+                                    && location.href.indexOf("/private/e-contracts/") !== -1;
+                                const apiStatus = diagnosticLastApiStatus;
+                                const latencyMs = Date.now() - buyClickAtMs;
+                                if (urlChanged || apiStatus === "APPLICATIONS_SUBMISSION_SUSPENDED") {
+                                    dbg("buy_click_verified", {
+                                        latencyMs,
+                                        delayUsedMs: timingGuard.waitMs,
+                                        urlChanged,
+                                        apiStatus
+                                    });
+                                } else {
+                                    const stillClickable = !!getBuyButtonDiagnostics()?.clickable;
+                                    dbg("buy_click_no_response", {
+                                        latencyMs,
+                                        delayUsedMs: timingGuard.waitMs,
+                                        urlChanged,
+                                        apiStatus,
+                                        buyButtonStillClickable: stillClickable
+                                    });
+                                }
+                            } catch (e) { try { console.warn("[TorgiBot dbg verify]", e); } catch (_) {} }
+                        }, 1500);
                         markBuyClicked(finalCheck.button);
                         setState("WAIT_CHECKBOX");
                         return;
@@ -3297,6 +3687,11 @@
                                 onLimit: () => {
                                     softAuthDialogRetryScheduled = false;
                                     if (state !== "WAIT_CHECKBOX") return;
+                                    recordAuthTerminalState("AUTH_OR_BACKEND_GATE", "soft_dialog_cancel_button_not_found", {
+                                        source: "soft_auth_cancel_not_found",
+                                        realAuthReason: null,
+                                        context: { softInfo }
+                                    });
                                     setState("AUTH_OR_BACKEND_GATE");
                                     stopAutomationTimersKeepJournal("soft_auth_cancel_not_found");
                                     updateWidget();
@@ -3314,6 +3709,15 @@
                                 html: authDialog.outerHTML ? authDialog.outerHTML.slice(0, 2000) : "",
                                 ...getBuyButtonDiagnosticFields()
                             }));
+                            recordAuthTerminalState("AUTH_OR_BACKEND_GATE", "soft_dialog_retry_exhausted", {
+                                source: "soft_auth_retry_limit_reached",
+                                realAuthReason: null,
+                                context: {
+                                    retryCount: softAuthDialogRetryCount,
+                                    retryMax: SOFT_AUTH_DIALOG_RETRY_MAX,
+                                    dialogText: softInfo.dialogText
+                                }
+                            });
                             setState("AUTH_OR_BACKEND_GATE");
                             stopAutomationTimersKeepJournal("soft_auth_retry_limit_reached");
                             updateWidget();
@@ -3362,6 +3766,18 @@
                     traceTestFlow("auth_dialog_after_buy", {
                         authDetails,
                         html: authDialog.outerHTML ? authDialog.outerHTML.slice(0, 2000) : ""
+                    });
+                    recordAuthTerminalState("AUTH_REQUIRED", "after_buy_dialog_real_auth", {
+                        source: "after_buy_dialog",
+                        realAuthReason: softInfo.realAuthReason || authDetails?.urlReason || null,
+                        context: {
+                            authDetails,
+                            softInfo: {
+                                publicLotUrl: softInfo.publicLotUrl,
+                                hasCancelButton: !!softInfo.cancelButton,
+                                dialogText: softInfo.dialogText
+                            }
+                        }
                     });
                     setState("AUTH_REQUIRED");
                     stopAllTimers();
@@ -3502,12 +3918,15 @@
             }
 
             if (state === "WAIT_SIGN_1") {
+                // v5.7.1: лок подписи СНЯТ с этой стадии — оферта подписывается параллельно во всех вкладках.
+                // Лок захватывается только перед открытием выпадающего списка сертификатов (cadesplugin).
                 const offerSignBtn = findButtonByText("Подписать", document);
                 traceTestFlowThrottled("wait_sign_offer", { buttonPresent: !!offerSignBtn });
                 if (!offerSignBtn) return;
-                if (!(await acquireSignLock("WAIT_SIGN_1"))) return;
+                dbg("offer_sign_button_found");
                 if (Date.now() - lastOfferSignClickAt < Number(settings?.offerSignClickCooldownMs ?? 500)) return;
                 if (aggressiveClick(offerSignBtn, "Подписать (оферта)")) {
+                    dbg("offer_sign_click");
                     lastOfferSignClickAt = Date.now();
                     return;
                 }
@@ -3519,6 +3938,7 @@
                     traceTestFlowThrottled("crypto_dialog_wait", {});
                     return;
                 }
+                dbg("crypto_dialog_seen");
 
                 const signBtn = findButtonByText("Подписать", overlay);
                 if (signBtn) {
@@ -3527,6 +3947,7 @@
                     });
                     if (Date.now() - lastCryptoSignClickAt < Number(settings?.cryptoSignClickCooldownMs ?? 500)) return;
                     if (aggressiveClick(signBtn, "Подписать (КриптоПро)")) {
+                        dbg("crypto_sign_click");
                         lastCryptoSignClickAt = Date.now();
                         setState("WAIT_CERT");
                         return;
@@ -3540,15 +3961,28 @@
                     traceTestFlow("certificate_selected", {
                         selectedCertificate: selectedCertificate.slice(0, 500)
                     });
+                    dbg("cert_selected");
+                    // v5.7.1: серт выбран, плагин свободен — отпускаем лок СРАЗУ, до клика «Выбрать».
+                    releaseSignLock("cert_selected");
                     setState("WAIT_SELECT");
                     return;
                 }
 
                 const options = getVisibleCertificateOptions();
                 if (!options.length) {
+                    // v5.7.1: лок захватываем ровно перед попыткой открыть выпадающий список сертификатов.
+                    // Это единственная фаза, где cadesplugin реально занят.
+                    if (!signLockHeld) {
+                        if (!(await acquireSignLock("WAIT_CERT"))) {
+                            dbg("sign_lock_blocked", { stage: "WAIT_CERT" });
+                            return;
+                        }
+                        dbg("sign_lock_held_at_cert");
+                    }
                     if (Date.now() - lastCertDropdownClickAt >= Number(settings?.certDropdownClickCooldownMs ?? 200)) {
                         lastCertDropdownClickAt = Date.now();
                         tryOpenCertDropdown();
+                        dbg("cert_dropdown_open_attempt");
                         log("Список сертификатов пока не появился, открываю дропдаун");
                     }
                     const certDiagnostics = collectCertificateDiagnostics();
@@ -3565,18 +3999,22 @@
                     count: options.length,
                     options: options.slice(0, 3).map(option => normalizeText(option.innerText || option.textContent).slice(0, 500))
                 });
+                dbg("cert_options_visible", { count: options.length });
 
                 if (clickCertificate()) {
+                    dbg("cert_click");
                     lastCertDropdownClickAt = Date.now();
                     return;
                 }
             }
 
             if (state === "WAIT_SELECT") {
+                dbg("select_stage_entered");
                 if (settings?.stopBeforeFinalSelect !== false) {
                     log("Тестовый режим: кнопка 'Выбрать' не нажимается автоматически");
                     markBuyFlowFinished("стоп перед Выбрать");
                     traceTestFlow("test_stop_before_select", collectDiagnosticPageSnapshot());
+                    dbg("select_test_stop");
                     playDoneSound();
                     setState("READY_SELECT");
                     releaseSignLock("test_stop_before_select");
@@ -3584,7 +4022,9 @@
                 }
 
                 const overlay = getCertificateDialog() || getTopOverlay() || document;
+                dbg("select_click_attempt");
                 if (clickButtonByText("Выбрать", overlay, "Выбрать")) {
+                    dbg("select_click_done");
                     finishBot();
                 }
             }
@@ -3966,6 +4406,7 @@
         softAuthDialogRetryScheduled = false;
         sessionStorage.removeItem("torgiBotSoftAuthDialogRetryCount");
         sessionStorage.removeItem("torgiBotPostReloadSoftAuthRetryCount");
+        clearAuthStateMeta();
         buyFlowStartedAt = 0;
         lastBuyButtonFoundAt = 0;
         combatWatchStartedAt = 0;
@@ -4027,6 +4468,7 @@
         softAuthDialogRetryScheduled = false;
         sessionStorage.removeItem("torgiBotSoftAuthDialogRetryCount");
         sessionStorage.removeItem("torgiBotPostReloadSoftAuthRetryCount");
+        clearAuthStateMeta();
         buyFlowStartedAt = 0;
         lastBuyButtonFoundAt = 0;
         combatWatchStartedAt = 0;
@@ -4132,6 +4574,17 @@
     try {
         chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             (async () => {
+                if (message?.type === "PING") {
+                    sendResponse({ ok: true, state, botEnabled: !!settings?.botEnabled });
+                    return;
+                }
+
+                if (message?.type === "QUERY_BUY_BUTTON") {
+                    sendResponse({ ok: true, present: isBuyButtonPresentDom() });
+                    return;
+                }
+
+
                 if (message?.type === "DIAGNOSTIC_START") {
                     await loadSettings();
                     startDiagnosticMode("popup");

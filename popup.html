@@ -195,6 +195,18 @@
 </div>
 
 <div class="section">
+  <div class="section-label">Все вкладки torgi.gov.ru <span id="tabs-count" style="color:#94a3b8;font-weight:400;">(—)</span></div>
+  <div class="btn-row">
+    <button id="start-all-btn" class="btn btn-primary">▶ Старт во всех</button>
+    <button id="stop-all-btn" class="btn btn-danger">⏸ Стоп во всех</button>
+  </div>
+  <div class="hint">
+    Включает/выключает бота сразу во всех открытых вкладках torgi.gov.ru.
+    Удобно для теста очереди приоритетов: откройте несколько лотов, включите «Тестовый режим» и нажмите «Старт во всех» — боты дойдут до момента подписи и остановятся.
+  </div>
+</div>
+
+<div class="section">
   <div class="section-label">Ручное время старта торгов</div>
 
   <div id="manual-active-box" class="manual-active" style="display:none;">
@@ -236,6 +248,8 @@
 	  <label for="buy-delay-select">Задержка после появления кликабельной кнопки</label>
 	  <select id="buy-delay-select">
 	    <option value="0">0 мс</option>
+	    <option value="100">100 мс</option>
+	    <option value="150">150 мс (рекомендуется)</option>
 	    <option value="300">300 мс</option>
 	    <option value="500">500 мс</option>
 	    <option value="700">700 мс</option>
@@ -265,12 +279,15 @@
 		    <button id="diag-copy-btn" class="btn btn-primary">Отчёт</button>
 	  </div>
 	  <div class="btn-row" style="margin-top:6px;">
-		    <button id="diag-reload-btn" class="btn btn-danger">Тест reload</button>
+		    <button id="diag-download-btn" class="btn btn-primary">Скачать .json</button>
 		    <button id="diag-clear-btn" class="btn btn-danger">Очистить журнал</button>
+		  </div>
+	  <div class="btn-row" style="margin-top:6px;">
+		    <button id="diag-reload-btn" class="btn btn-danger">Тест reload</button>
 		  </div>
 		</div>
 
-	<div class="footer">v4.23.2 · F8 вкл/выкл · F9 сброс · F10 синхр. времени</div>
+	<div class="footer">v5.7 · F8 вкл/выкл · F9 сброс · F10 синхр. времени</div>
 
 <script src="popup.js"></script>
 </body>
